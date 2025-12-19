@@ -15,7 +15,7 @@ Set these in **Repo → Settings → Secrets and variables → Actions → Secre
 - `OCI_REGION` (e.g., `eu-frankfurt-1`)
 - `OCI_INSTANCE_OCID`
 - `OCI_API_KEY_PEM` (full private key contents)
-- `HEALTH_URL` (e.g., `http://79.76.100.87/` or `http://binancetrader.vuyelwa.com/`)
+- `HEALTH_URL` (e.g., `http://79.76.100.87/api/health?run_mode=live`)
 
 ## Workflow
 - File: `.github/workflows/vm_watchdog.yml`
@@ -24,7 +24,7 @@ Set these in **Repo → Settings → Secrets and variables → Actions → Secre
 
 ## Notes
 - **SOFTRESET** is used to preserve the boot volume while rebooting the VM.
-- If you want a safer signal than the root path, expose a `/api/health` endpoint and point `HEALTH_URL` to it.
+- The dashboard’s `/api/health` endpoint returns **200** when trader + candles are fresh, **503** when stale.
 - The workflow installs `oci-cli` at runtime and writes a temporary config/key to the runner.
 
 ## Troubleshooting
