@@ -44,6 +44,8 @@ jobs:
 
       - name: Soft reset instance if unhealthy
         if: steps.health.outputs.healthy != 'true'
+        env:
+          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: True
         run: |
           oci compute instance action \
             --instance-id "${{ secrets.OCI_INSTANCE_OCID }}" \
