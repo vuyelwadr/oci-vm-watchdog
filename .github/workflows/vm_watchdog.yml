@@ -55,7 +55,7 @@ jobs:
       - name: Attempt 2 - Hard Reboot VM (OCI)
         if: steps.health_check.outcome == 'failure' && steps.health_retry.outcome == 'failure'
         run: |
-          echo "Restart failed. Triggering OCI SOFTRESET..."
+          echo "Restart failed. Checking VM state before triggering SOFTRESET..."
           
           # Install OCI CLI
           pip install oci-cli --quiet
@@ -75,19 +75,35 @@ EOF
           chmod 600 /home/runner/.oci/oci_api_key.pem
           chmod 600 ~/.oci/config
           
-          # Debug: show config (secrets masked by GitHub)
-          echo "--- OCI Config ---"
-          cat ~/.oci/config
-          echo "--- End Config ---"
+          # Check current lifecycle state first
+          echo "Checking VM lifecycle state..."
+          STATE=$(oci compute instance get \
+            --instance-id "${{ secrets.OCI_INSTANCE_OCID }}" \
+            --query 'data."lifecycle-state"' \
+            --raw-output)
+          echo "Current VM state: $STATE"
           
-          # Trigger reboot
-          echo "Triggering SOFTRESET on instance..."
+          # If already cycling (STOPPING/STARTING), don't trigger another action
+          # E2.micro can take 30-40 minutes to complete a reboot cycle
+          if [ "$STATE" = "STOPPING" ] || [ "$STATE" = "STARTING" ]; then
+            echo "VM is already in $STATE state - reboot cycle in progress."
+            echo "E2.micro can take 30-40 minutes to complete. Exiting without action."
+            exit 0
+          fi
+          
+          # Only SOFTRESET if in RUNNING (but frozen) state
+          if [ "$STATE" != "RUNNING" ]; then
+            echo "VM in unexpected state: $STATE. Not triggering SOFTRESET."
+            exit 1
+          fi
+          
+          echo "VM is RUNNING (but frozen). Triggering SOFTRESET..."
           oci compute instance action \
             --instance-id "${{ secrets.OCI_INSTANCE_OCID }}" \
-            --action SOFTRESET \
-            --wait-for-state RUNNING \
-            --max-wait-seconds 600
+            --action SOFTRESET
           
-          echo "VM reboot complete!"
+          echo "SOFTRESET triggered! VM will reboot (may take 30-40 min on E2.micro)."
+          echo "Next scheduled run will verify recovery."
         env:
           OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: True
+
