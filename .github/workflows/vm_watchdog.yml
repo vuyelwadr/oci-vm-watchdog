@@ -56,25 +56,38 @@ jobs:
         if: steps.health_check.outcome == 'failure' && steps.health_retry.outcome == 'failure'
         run: |
           echo "Restart failed. Triggering OCI SOFTRESET..."
+          
           # Install OCI CLI
           pip install oci-cli --quiet
-          # Write config
+          
+          # Write config (CRITICAL: no leading spaces in INI content!)
           mkdir -p ~/.oci
-          cat > ~/.oci/config <<CONFIG
-          [DEFAULT]
-          user=${{ secrets.OCI_USER_OCID }}
-          fingerprint=${{ secrets.OCI_FINGERPRINT }}
-          tenancy=${{ secrets.OCI_TENANCY_OCID }}
-          region=${{ secrets.OCI_REGION }}
-          key_file=/home/runner/.oci/oci_api_key.pem
-          CONFIG
+          cat > ~/.oci/config <<'EOF'
+[DEFAULT]
+user=${{ secrets.OCI_USER_OCID }}
+fingerprint=${{ secrets.OCI_FINGERPRINT }}
+tenancy=${{ secrets.OCI_TENANCY_OCID }}
+region=${{ secrets.OCI_REGION }}
+key_file=/home/runner/.oci/oci_api_key.pem
+EOF
+          
           echo "${{ secrets.OCI_API_KEY_PEM }}" > /home/runner/.oci/oci_api_key.pem
           chmod 600 /home/runner/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/config
+          
+          # Debug: show config (secrets masked by GitHub)
+          echo "--- OCI Config ---"
+          cat ~/.oci/config
+          echo "--- End Config ---"
+          
           # Trigger reboot
+          echo "Triggering SOFTRESET on instance..."
           oci compute instance action \
             --instance-id "${{ secrets.OCI_INSTANCE_OCID }}" \
             --action SOFTRESET \
             --wait-for-state RUNNING \
             --max-wait-seconds 600
+          
+          echo "VM reboot complete!"
         env:
           OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: True
