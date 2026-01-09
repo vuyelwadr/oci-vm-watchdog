@@ -17,13 +17,28 @@ jobs:
         run: |
           response=$(curl -sL -o /dev/null -w "%{http_code}" "http://${{ secrets.SSH_HOST }}/api/health?run_mode=live" --max-time 30 || echo "000")
           echo "Health check response: $response"
+          
+          # 200 = fully healthy
+          # 503 = dashboard up, trader still starting (acceptable after reboot)
+          # 000 = timeout/unreachable (VM frozen or rebooting)
+          
           if [ "$response" = "200" ]; then
             echo "✅ Health OK!"
             echo "status=ok" >> $GITHUB_OUTPUT
+          elif [ "$response" = "503" ]; then
+            echo "⏳ Dashboard up but trader starting (503) - acceptable, needs more time"
+            echo "status=starting" >> $GITHUB_OUTPUT
           else
             echo "❌ Health Check Failed! Status: $response"
             echo "status=failed" >> $GITHUB_OUTPUT
           fi
+
+      - name: Exit Early if Healthy or Starting
+        if: steps.health_check.outputs.status == 'ok' || steps.health_check.outputs.status == 'starting'
+        run: |
+          echo "✅ VM is healthy or still starting up. No action needed."
+          echo "If status was 'starting' (503), the trader service may need more time to initialize."
+          echo "Will check again in 15 minutes."
 
       - name: Setup SSH
         if: steps.health_check.outputs.status == 'failed'
@@ -45,26 +60,29 @@ jobs:
             echo "ssh_failed=true" >> $GITHUB_OUTPUT
             exit 0
           }
-          echo "Service restart command sent. Waiting 45s..."
-          sleep 45
+          echo "Service restart command sent. Waiting 60s for services to start..."
+          sleep 60
 
       - name: Verify Health After Restart
         if: steps.health_check.outputs.status == 'failed' && steps.service_restart.outputs.ssh_failed != 'true'
         id: health_retry
         run: |
           response=$(curl -sL -o /dev/null -w "%{http_code}" "http://${{ secrets.SSH_HOST }}/api/health?run_mode=live" --max-time 30 || echo "000")
-          if [ "$response" = "200" ]; then
-            echo "✅ Recovered after service restart!"
+          echo "Post-restart health check: $response"
+          
+          # Accept both 200 (healthy) and 503 (starting) as success after restart
+          if [ "$response" = "200" ] || [ "$response" = "503" ]; then
+            echo "✅ Services responding after restart!"
             echo "status=ok" >> $GITHUB_OUTPUT
           else
             echo "❌ Still failing. Status: $response"
             echo "status=failed" >> $GITHUB_OUTPUT
           fi
 
-      - name: Attempt 2 - OCI VM Action
-        if: steps.health_check.outputs.status == 'failed' && (steps.service_restart.outputs.ssh_failed == 'true' || steps.health_retry.outputs.status == 'failed')
+      - name: Attempt 2 - OCI VM Action (Only if SSH completely failed)
+        if: steps.health_check.outputs.status == 'failed' && steps.service_restart.outputs.ssh_failed == 'true'
         run: |
-          echo "SSH restart failed. Checking VM state via OCI..."
+          echo "SSH completely failed. Checking VM state via OCI..."
           
           # Install OCI CLI
           pip install oci-cli --quiet
@@ -91,8 +109,10 @@ jobs:
           echo "Current VM state: $STATE"
           
           case "$STATE" in
-            STOPPING|STARTING|TERMINATED|TERMINATING)
-              echo "⏳ VM is in $STATE state - cannot take action. Will check again next run."
+            STOPPING|STARTING)
+              echo "⏳ VM is in $STATE state - reboot in progress."
+              echo "E2.micro takes 30-40 min to boot. Will check again next run."
+              echo "DO NOT trigger another reboot!"
               ;;
             STOPPED)
               echo "🚀 VM is STOPPED. Starting it..."
@@ -102,14 +122,19 @@ jobs:
               echo "START command sent. VM will boot in 30-40 min."
               ;;
             RUNNING)
-              echo "🔄 VM is RUNNING but frozen. Triggering SOFTRESET..."
+              echo "🔄 VM is RUNNING but completely frozen (SSH failed)."
+              echo "Triggering SOFTRESET as last resort..."
               oci compute instance action \
                 --instance-id "${{ secrets.OCI_INSTANCE_OCID }}" \
                 --action SOFTRESET || echo "SOFTRESET action failed"
               echo "SOFTRESET command sent. VM will reboot in 30-40 min."
+              echo "⚠️ Next 2-3 health checks will likely fail during boot - this is expected!"
+              ;;
+            TERMINATED|TERMINATING)
+              echo "❌ VM is TERMINATED - cannot recover!"
               ;;
             *)
-              echo "⚠️ Unexpected state: $STATE"
+              echo "⚠️ Unknown state: $STATE"
               ;;
           esac
           
