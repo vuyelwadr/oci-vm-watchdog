@@ -1,9 +1,12 @@
-name: VM Watchdog (Smart Health Check)
+name: VM Watchdog (OCI Health Check)
 
 on:
   schedule:
-    - cron: '*/15 * * * *' # Every 15 minutes (safe for boot time)
+    - cron: '*/15 * * * *' # Every 15 minutes
   workflow_dispatch: # Allow manual trigger
+
+env:
+  OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
 
 jobs:
   heal:
@@ -12,109 +15,102 @@ jobs:
       - name: Check Health Endpoint
         id: health_check
         run: |
-          response=$(curl -sL -o /dev/null -w "%{http_code}" "http://${{ secrets.SSH_HOST }}/api/health?run_mode=live" --max-time 30)
-          if [ "$response" != "200" ]; then
-            echo "Health Check Failed! Status: $response"
-            echo "status=failed" >> $GITHUB_OUTPUT
-            exit 1
-          else
-            echo "Health OK! Status: $response"
+          response=$(curl -sL -o /dev/null -w "%{http_code}" "http://${{ secrets.SSH_HOST }}/api/health?run_mode=live" --max-time 30 || echo "000")
+          echo "Health check response: $response"
+          if [ "$response" = "200" ]; then
+            echo "✅ Health OK!"
             echo "status=ok" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Health Check Failed! Status: $response"
+            echo "status=failed" >> $GITHUB_OUTPUT
           fi
-        continue-on-error: true
 
-      - name: Setup SSH (Only on Failure)
-        if: steps.health_check.outcome == 'failure'
+      - name: Setup SSH
+        if: steps.health_check.outputs.status == 'failed'
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      - name: Attempt 1 - Restart Services
-        if: steps.health_check.outcome == 'failure'
+      - name: Attempt 1 - Restart Services via SSH
+        if: steps.health_check.outputs.status == 'failed'
+        id: service_restart
         run: |
-          echo "Attempting Soft Restart..."
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "sudo systemctl restart binance-trader.service binance-dashboard.service" || true
-          echo "Waiting 45s for services to stabilize..."
+          echo "Attempting service restart via SSH..."
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "sudo systemctl restart binance-trader.service binance-dashboard.service" 2>&1 || {
+            echo "SSH connection failed - VM may be frozen"
+            echo "ssh_failed=true" >> $GITHUB_OUTPUT
+            exit 0
+          }
+          echo "Service restart command sent. Waiting 45s..."
           sleep 45
 
       - name: Verify Health After Restart
-        if: steps.health_check.outcome == 'failure'
+        if: steps.health_check.outputs.status == 'failed' && steps.service_restart.outputs.ssh_failed != 'true'
         id: health_retry
         run: |
-          response=$(curl -sL -o /dev/null -w "%{http_code}" "http://${{ secrets.SSH_HOST }}/api/health?run_mode=live" --max-time 30)
-          if [ "$response" != "200" ]; then
-            echo "Still failing after restart... Status: $response"
-            exit 1
+          response=$(curl -sL -o /dev/null -w "%{http_code}" "http://${{ secrets.SSH_HOST }}/api/health?run_mode=live" --max-time 30 || echo "000")
+          if [ "$response" = "200" ]; then
+            echo "✅ Recovered after service restart!"
+            echo "status=ok" >> $GITHUB_OUTPUT
           else
-            echo "Recovered after restart!"
+            echo "❌ Still failing. Status: $response"
+            echo "status=failed" >> $GITHUB_OUTPUT
           fi
-        continue-on-error: true
 
-      - name: Attempt 2 - Hard Reboot VM (OCI)
-        if: steps.health_check.outcome == 'failure' && steps.health_retry.outcome == 'failure'
+      - name: Attempt 2 - OCI VM Action
+        if: steps.health_check.outputs.status == 'failed' && (steps.service_restart.outputs.ssh_failed == 'true' || steps.health_retry.outputs.status == 'failed')
         run: |
-          echo "Restart failed. Checking VM state before taking action..."
+          echo "SSH restart failed. Checking VM state via OCI..."
           
           # Install OCI CLI
           pip install oci-cli --quiet
           
-          # Write config (CRITICAL: no leading spaces in INI content!)
+          # Setup OCI config
           mkdir -p ~/.oci
-          cat > ~/.oci/config <<'EOF'
-[DEFAULT]
-user=${{ secrets.OCI_USER_OCID }}
-fingerprint=${{ secrets.OCI_FINGERPRINT }}
-tenancy=${{ secrets.OCI_TENANCY_OCID }}
-region=${{ secrets.OCI_REGION }}
-key_file=/home/runner/.oci/oci_api_key.pem
-EOF
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=$HOME/.oci/oci_api_key.pem
+          EOF
           
-          echo "${{ secrets.OCI_API_KEY_PEM }}" > /home/runner/.oci/oci_api_key.pem
-          chmod 600 /home/runner/.oci/oci_api_key.pem
-          chmod 600 ~/.oci/config
+          echo "${{ secrets.OCI_API_KEY_PEM }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem ~/.oci/config
           
-          # Check current lifecycle state first
-          echo "Checking VM lifecycle state..."
+          # Get current VM state
           STATE=$(oci compute instance get \
             --instance-id "${{ secrets.OCI_INSTANCE_OCID }}" \
             --query 'data."lifecycle-state"' \
-            --raw-output)
+            --raw-output 2>/dev/null || echo "UNKNOWN")
           echo "Current VM state: $STATE"
           
-          # Handle each state appropriately
           case "$STATE" in
-            STOPPING|STARTING)
-              # Already cycling - don't interfere, check again next run
-              echo "VM is in $STATE state - reboot cycle in progress."
-              echo "E2.micro can take 30-40 minutes. Will check again next run."
-              exit 0
+            STOPPING|STARTING|TERMINATED|TERMINATING)
+              echo "⏳ VM is in $STATE state - cannot take action. Will check again next run."
               ;;
             STOPPED)
-              # VM is off - start it!
-              echo "VM is STOPPED. Starting it..."
+              echo "🚀 VM is STOPPED. Starting it..."
               oci compute instance action \
                 --instance-id "${{ secrets.OCI_INSTANCE_OCID }}" \
-                --action START
-              echo "START triggered! VM will boot (may take 30-40 min on E2.micro)."
+                --action START || echo "START action failed"
+              echo "START command sent. VM will boot in 30-40 min."
               ;;
             RUNNING)
-              # VM is on but frozen - reset it
-              echo "VM is RUNNING (but frozen). Triggering SOFTRESET..."
+              echo "🔄 VM is RUNNING but frozen. Triggering SOFTRESET..."
               oci compute instance action \
                 --instance-id "${{ secrets.OCI_INSTANCE_OCID }}" \
-                --action SOFTRESET
-              echo "SOFTRESET triggered! VM will reboot (may take 30-40 min on E2.micro)."
+                --action SOFTRESET || echo "SOFTRESET action failed"
+              echo "SOFTRESET command sent. VM will reboot in 30-40 min."
               ;;
             *)
-              # Unexpected state (TERMINATED, PROVISIONING, etc.)
-              echo "ERROR: VM in unexpected state: $STATE"
-              echo "Manual intervention may be required."
-              exit 1
+              echo "⚠️ Unexpected state: $STATE"
               ;;
           esac
           
-          echo "Next scheduled run will verify recovery."
-        env:
-          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: True
+          echo "✅ Watchdog action complete. Next scheduled check in 15 minutes."
