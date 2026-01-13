@@ -25,16 +25,13 @@ jobs:
           if [ "$response" = "200" ]; then
             echo "✅ Health OK!"
             echo "status=ok" >> $GITHUB_OUTPUT
-          elif [ "$response" = "503" ]; then
-            echo "⏳ Dashboard up but trader starting (503) - acceptable, needs more time"
-            echo "status=starting" >> $GITHUB_OUTPUT
           else
             echo "❌ Health Check Failed! Status: $response"
             echo "status=failed" >> $GITHUB_OUTPUT
           fi
 
       - name: Exit Early if Healthy or Starting
-        if: steps.health_check.outputs.status == 'ok' || steps.health_check.outputs.status == 'starting'
+        if: steps.health_check.outputs.status == 'ok'
         run: |
           echo "✅ VM is healthy or still starting up. No action needed."
           echo "If status was 'starting' (503), the trader service may need more time to initialize."
